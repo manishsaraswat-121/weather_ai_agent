@@ -2,7 +2,7 @@
 .env
 .env.local
 .env.*.local
-.github/workflows
+.github/
 
 # Python
 __pycache__/
