@@ -2,7 +2,6 @@
 .env
 .env.local
 .env.*.local
-.github/
 
 # Python
 __pycache__/
