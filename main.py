@@ -16,8 +16,6 @@ from langchain_qdrant import QdrantVectorStore
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import StateGraph, END
 
-#from qdrant_client import QdrantClient
-
 # ---------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------
@@ -44,7 +42,11 @@ class GraphState(TypedDict):
 # ---------------------------------------------------------------------
 
 class AIAgent:
-    """Main AI Agent handling weather and PDF queries"""
+    """
+    AI Agent handling ONLY:
+    - Weather queries
+    - PDF grounded RAG queries
+    """
 
     def __init__(
         self,
@@ -56,16 +58,14 @@ class AIAgent:
         self.openai_api_key = openai_api_key
         self.openweather_api_key = openweather_api_key
 
-        # ---------------- LangSmith (SAFE) ----------------
+        # ---------------- LangSmith (Optional & Safe) ----------------
         if langsmith_api_key:
-            #os.environ["LANGSMITH_TRACING"] = "true"
-            #os.environ["LANGSMITH_API_KEY"] = langsmith_api_key
             os.environ["LANGSMITH_PROJECT"] = "weather_api_tracing"
 
-        # ---------------- LLM (OpenRouter) ----------------
+        # ---------------- LLM ----------------
         self.llm = ChatOpenAI(
             model="gpt-3.5-turbo",
-            temperature=0.7,
+            temperature=0.3,
             api_key=openai_api_key,
             base_url="https://openrouter.ai/api/v1",
             default_headers={
@@ -79,21 +79,14 @@ class AIAgent:
             model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
 
-
-        # ---------------- Qdrant (RESTORED + FIXED) ----------------
-        '''if qdrant_url == ":memory:":
-            self.qdrant_client = QdrantClient(":memory:")
-        else:
-            self.qdrant_client = QdrantClient(url=qdrant_url)'''
-
         self.collection_name = "pdf_documents"
         self.vector_store = None
 
-        # ---------------- Graph ----------------
+        # ---------------- LangGraph ----------------
         self.graph = self._build_graph()
 
     # -----------------------------------------------------------------
-    # LangGraph
+    # Graph Construction
     # -----------------------------------------------------------------
 
     def _build_graph(self):
@@ -130,19 +123,16 @@ class AIAgent:
         query = state["query"].lower()
 
         weather_keywords = [
-            "weather",
-            "temperature",
-            "forecast",
-            "climate",
-            "rain",
-            "sunny",
-            "cloudy",
+            "weather", "temperature", "forecast",
+            "climate", "rain", "sunny", "cloudy",
         ]
 
         if any(k in query for k in weather_keywords):
             state["query_type"] = "weather"
+
         elif self.vector_store is not None:
             state["query_type"] = "pdf"
+
         else:
             state["query_type"] = "unknown"
 
@@ -160,14 +150,15 @@ class AIAgent:
         try:
             city = self._extract_city(state["query"])
 
-            url = "https://api.openweathermap.org/data/2.5/weather"
-            params = {
-                "q": city,
-                "appid": self.openweather_api_key,
-                "units": "metric",
-            }
-
-            response = requests.get(url, params=params, timeout=10)
+            response = requests.get(
+                "https://api.openweathermap.org/data/2.5/weather",
+                params={
+                    "q": city,
+                    "appid": self.openweather_api_key,
+                    "units": "metric",
+                },
+                timeout=10,
+            )
             response.raise_for_status()
             data = response.json()
 
@@ -182,8 +173,8 @@ class AIAgent:
 
         except Exception as e:
             logger.error(f"Weather error: {e}")
-            state["weather_data"] = {}
             state["error"] = "Weather data could not be retrieved."
+            state["weather_data"] = {}
 
         return state
 
@@ -193,9 +184,8 @@ class AIAgent:
             "If none found, return London.\nQuery: {query}\nCity:"
         )
         try:
-            chain = prompt | self.llm
-            result = chain.invoke({"query": query})
-            return result.content.strip() or "London"
+            res = (prompt | self.llm).invoke({"query": query})
+            return res.content.strip() or "London"
         except Exception:
             return "London"
 
@@ -214,6 +204,21 @@ class AIAgent:
         return state
 
     # -----------------------------------------------------------------
+    # STRICT Context Validation (🔥 KEY FIX 🔥)
+    # -----------------------------------------------------------------
+
+    def _is_context_relevant(self, query: str, context: str) -> bool:
+        if not context.strip():
+            return False
+
+        query_terms = set(query.lower().split())
+        context_terms = set(context.lower().split())
+
+        overlap = query_terms.intersection(context_terms)
+
+        return len(overlap) >= 2
+
+    # -----------------------------------------------------------------
     # Response Generation
     # -----------------------------------------------------------------
 
@@ -224,21 +229,35 @@ class AIAgent:
                 prompt = ChatPromptTemplate.from_template(
                     "Weather details:\n"
                     "City: {city}\n"
-                    "Temp: {temperature}°C (Feels like {feels_like}°C)\n"
+                    "Temperature: {temperature}°C\n"
+                    "Feels Like: {feels_like}°C\n"
                     "Condition: {description}\n"
                     "Humidity: {humidity}%\n"
-                    "Wind: {wind_speed} m/s\n\n"
-                    "Answer the user query: {query}"
+                    "Wind Speed: {wind_speed} m/s\n\n"
+                    "Answer the query: {query}"
                 )
                 res = (prompt | self.llm).invoke({**w, "query": state["query"]})
                 state["llm_response"] = res.content
 
             elif state["query_type"] == "pdf":
+
+                if not self._is_context_relevant(
+                    state["query"], state["pdf_context"]
+                ):
+                    state["llm_response"] = (
+                        "Please ask a question strictly related to the "
+                        "uploaded PDF documents. I cannot answer general "
+                        "knowledge questions."
+                    )
+                    return state
+
                 prompt = ChatPromptTemplate.from_template(
-                    "Use the context below to answer the question.\n\n"
+                    "Answer ONLY using the context below. "
+                    "If the answer is not present, say so explicitly.\n\n"
                     "Context:\n{context}\n\n"
                     "Question: {query}\nAnswer:"
                 )
+
                 res = (prompt | self.llm).invoke(
                     {"context": state["pdf_context"], "query": state["query"]}
                 )
@@ -246,17 +265,18 @@ class AIAgent:
 
             else:
                 state["llm_response"] = (
-                    "I couldn't determine whether this is a weather or document query."
+                    "Please ask a weather-related question or a question "
+                    "based on the available PDF documents."
                 )
 
         except Exception as e:
             logger.error(f"LLM error: {e}")
-            state["llm_response"] = str(e)
+            state["llm_response"] = "An error occurred while generating the response."
 
         return state
 
     # -----------------------------------------------------------------
-    # PDF Loader (✅ FIXED & WORKING)
+    # PDF Loader
     # -----------------------------------------------------------------
 
     def load_pdf(self, pdf_path: str) -> bool:
@@ -269,15 +289,17 @@ class AIAgent:
                 chunk_overlap=200,
             )
             splits = splitter.split_documents(docs)
-            
+
             self.vector_store = QdrantVectorStore.from_documents(
                 documents=splits,
                 embedding=self.embeddings,
-                location=":memory:",        # 🔥 THIS IS THE FIX
-                collection_name="pdf_documents",
+                location=":memory:",
+                collection_name=self.collection_name,
             )
+
             logger.info("PDF loaded and indexed successfully")
             return True
+
         except Exception as e:
             logger.error(f"PDF load error: {e}")
             return False
@@ -296,17 +318,3 @@ class AIAgent:
             "error": "",
         }
         return self.graph.invoke(state)
-
-# ---------------------------------------------------------------------
-# Example Run
-# ---------------------------------------------------------------------
-
-if __name__ == "__main__":
-    agent = AIAgent(
-        openai_api_key=os.getenv("OPENAI_API_KEY"),
-        openweather_api_key=os.getenv("OPENWEATHER_API_KEY"),
-        langsmith_api_key=os.getenv("LANGSMITH_API_KEY"),
-    )
-
-    result = agent.query("What's the weather in Paris?")
-    print("\nResponse:\n", result["llm_response"])
